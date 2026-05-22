@@ -1,0 +1,4 @@
+# Dependencies for the Wikimedia → Kafka ingestion script
+kafka-python>=2.0.2
+requests>=2.31.0
+sseclient-py>=1.8.0

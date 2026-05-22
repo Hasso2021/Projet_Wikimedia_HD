@@ -1,0 +1,75 @@
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials/
+secrets/
+**/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ingestion/.venv/
+dashboard/.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs (tous emplacements)
+*.log
+logs/
+airflow/logs/*
+!airflow/logs/.gitkeep
+
+# Spark — checkpoints et données locales (le lake est dans HDFS Docker)
+spark/checkpoints/
+spark/data/*
+!spark/data/.gitkeep
+
+# Exports HDFS / JSON volumineux locaux
+wikimedia_processed.json
+wikimedia_*.json
+sample.json
+export_*.json
+*.jsonl
+data/export/
+data/local/
+hdfs-export/
+
+# Volumes Docker / données persistantes locales (si copiées hors conteneur)
+hdfs-data/
+kafka-data/
+namenode-data/
+datanode-data/
+zookeeper-data/
+postgres-data/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Fichiers temporaires
+/tmp/
+*.tmp
+*.bak
+*.swp
+~$*

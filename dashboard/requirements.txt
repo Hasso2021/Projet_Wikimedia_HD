@@ -1,0 +1,5 @@
+# Dashboard Wikimedia — dépendances Python
+streamlit>=1.33.0
+pandas>=2.0.0
+plotly>=5.18.0
+kafka-python>=2.0.2
