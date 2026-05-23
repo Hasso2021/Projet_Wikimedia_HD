@@ -1,11 +1,10 @@
 """
 Producteur Wikimedia EventStream → Kafka.
 
-Écoute : https://stream.wikimedia.org/v2/stream/recentchange
-Topic valide : wm.recentchange.raw
-Topic erreurs : wm.errors
+Topics : wm.recentchange.raw, wm.bot.events, wm.page.edits, wm.errors
+Classification : bot/humain, anonyme/connecté, type d'événement (edit, new, delete…)
 
-Lancement (Kafka démarré) :
+Lancement :
     pip install -r ingestion/requirements.txt
     python ingestion/wikimedia_producer.py --max-events 100
 """
@@ -33,7 +32,10 @@ STREAM_URL = "https://stream.wikimedia.org/v2/stream/recentchange"
 DEFAULT_KAFKA_BOOTSTRAP = "localhost:9092"
 
 TOPIC_VALID = "wm.recentchange.raw"
+TOPIC_BOT = "wm.bot.events"
+TOPIC_PAGE_EDITS = "wm.page.edits"
 TOPIC_ERRORS = "wm.errors"
+EDIT_EVENT_TYPES = frozenset({"edit", "annotate"})
 
 # User-Agent explicite (exigence Wikimedia)
 USER_AGENT = "WikimediaBigData-Master/1.0 (projet Master Big Data; ingestion Kafka)"
@@ -161,10 +163,13 @@ def validate_event(event: dict[str, Any]) -> tuple[bool, str | None]:
 
 
 def build_valid_record(raw_event: dict[str, Any]) -> dict[str, Any]:
-    """Enrichit l'événement Wikimedia pour le topic wm.recentchange.raw."""
+    """Enrichit l'événement Wikimedia (métadonnées + classification)."""
     wiki = extract_wiki(raw_event) or "unknown"
     title = extract_title(raw_event) or "unknown"
     user = extract_user(raw_event)
+    page_id = raw_event.get("page_id")
+    if page_id is None and isinstance(raw_event.get("meta"), dict):
+        page_id = raw_event["meta"].get("id")
 
     return {
         "ingestion_timestamp": utc_now_iso(),
@@ -176,8 +181,34 @@ def build_valid_record(raw_event: dict[str, Any]) -> dict[str, Any]:
         "wiki": wiki,
         "title": title,
         "user": user,
+        "page_id": page_id,
         "payload": raw_event,
     }
+
+
+def publish_valid_event(
+    producer: KafkaProducer,
+    record: dict[str, Any],
+    key: str,
+) -> list[str]:
+    """
+    Route l'événement vers les topics Kafka requis par le sujet.
+    Retourne la liste des topics utilisés.
+    """
+    topics_sent: list[str] = []
+    send_to_kafka(producer, TOPIC_VALID, record, key=key)
+    topics_sent.append(TOPIC_VALID)
+
+    if record.get("is_bot") is True:
+        send_to_kafka(producer, TOPIC_BOT, record, key=key)
+        topics_sent.append(TOPIC_BOT)
+
+    event_type = str(record.get("event_type", "")).lower()
+    if event_type in EDIT_EVENT_TYPES:
+        send_to_kafka(producer, TOPIC_PAGE_EDITS, record, key=key)
+        topics_sent.append(TOPIC_PAGE_EDITS)
+
+    return topics_sent
 
 
 def build_error_record(
@@ -247,7 +278,10 @@ def run_producer(
     stats = {"valid": 0, "invalid": 0, "total": 0}
 
     print(f"[INFO] Flux Wikimedia : {stream_url}")
-    print(f"[INFO] Topic valide : {TOPIC_VALID} | Erreurs : {TOPIC_ERRORS}")
+    print(
+        f"[INFO] Topics : {TOPIC_VALID}, {TOPIC_BOT}, {TOPIC_PAGE_EDITS} | "
+        f"Erreurs : {TOPIC_ERRORS}"
+    )
     if max_events:
         print(f"[INFO] Arrêt après {max_events} événements (valides + invalides).")
     print("[INFO] CTRL+C pour arrêter proprement.\n")
@@ -309,11 +343,11 @@ def run_producer(
             if is_valid:
                 record = build_valid_record(raw_event)
                 key = record["partition_key"]
-                send_to_kafka(producer, TOPIC_VALID, record, key=key)
+                topics_sent = publish_valid_event(producer, record, key)
                 stats["valid"] += 1
                 print(
                     f"[OK]   #{stats['total']} {record['event_type']} | "
-                    f"{record['wiki']} | {record['title'][:50]} → {TOPIC_VALID}"
+                    f"{record['wiki']} | {record['title'][:50]} → {', '.join(topics_sent)}"
                 )
             else:
                 error_record = build_error_record(

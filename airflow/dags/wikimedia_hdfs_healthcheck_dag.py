@@ -14,6 +14,7 @@ import pendulum
 from airflow.sdk import dag, task
 
 from common.wikimedia_hdfs_utils import (
+    HDFS_ANOMALIES_ROOT,
     HDFS_PROCESSED_PATH,
     HDFS_REPORTS_ROOT,
     REPORT_SUBDIRS,
@@ -97,10 +98,13 @@ def wikimedia_hdfs_healthcheck():
             folders_status[subdir] = exists
             logger.info("Dossier %s : %s", path, "OK" if exists else "MANQUANT")
 
+        anomalies_exists = webhdfs_path_exists(HDFS_ANOMALIES_ROOT)
         root_exists = webhdfs_path_exists(HDFS_REPORTS_ROOT)
         return {
             "reports_root": HDFS_REPORTS_ROOT,
             "reports_root_exists": root_exists,
+            "anomalies_root": HDFS_ANOMALIES_ROOT,
+            "anomalies_root_exists": anomalies_exists,
             "subfolders": folders_status,
         }
 

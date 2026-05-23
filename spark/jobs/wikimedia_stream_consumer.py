@@ -42,8 +42,8 @@ KAFKA_GROUP_HDFS = "wikimedia-spark-hdfs"
 # ---------------------------------------------------------------------------
 # Namenode RPC sur le port 8020 (config/hadoop.env).
 HDFS_NAMENODE = "hdfs://namenode:8020"
-HDFS_OUTPUT_PATH = f"{HDFS_NAMENODE}/hdfs-data/wikimedia/processed"
-HDFS_CHECKPOINT_PATH = f"{HDFS_NAMENODE}/hdfs-data/wikimedia/checkpoints/stream-consumer"
+HDFS_OUTPUT_PATH = f"{HDFS_NAMENODE}/data/wikimedia/processed"
+HDFS_CHECKPOINT_PATH = f"{HDFS_NAMENODE}/data/wikimedia/checkpoints/stream-consumer"
 
 # Schéma JSON attendu : champs ajoutés par ingestion/wikimedia_producer.py
 WIKIMEDIA_RECORD_SCHEMA = StructType(
@@ -57,6 +57,7 @@ WIKIMEDIA_RECORD_SCHEMA = StructType(
         StructField("ingestion_timestamp", StringType(), nullable=True),
         StructField("source", StringType(), nullable=True),
         StructField("partition_key", StringType(), nullable=True),
+        StructField("page_id", StringType(), nullable=True),
     ]
 )
 
@@ -132,6 +133,7 @@ def parse_kafka_values(kafka_df):
         col("event.ingestion_timestamp"),
         col("event.source"),
         col("event.partition_key"),
+        col("event.page_id"),
     )
 
 

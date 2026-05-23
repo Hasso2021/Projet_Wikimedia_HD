@@ -190,7 +190,15 @@ def poll_kafka_events(
 # ---------------------------------------------------------------------------
 
 WEBHDFS_BASE = os.getenv("WEBHDFS_BASE", "http://namenode:9870/webhdfs/v1")
-HDFS_REPORTS_ROOT = os.getenv("HDFS_REPORTS_PATH", "/hdfs-data/wikimedia/reports")
+HDFS_DATA_ROOT = os.getenv("HDFS_DATA_ROOT", "/data/wikimedia")
+HDFS_REPORTS_ROOT = os.getenv("HDFS_REPORTS_PATH", f"{HDFS_DATA_ROOT}/reports")
+HDFS_ANOMALIES_ROOT = f"{HDFS_DATA_ROOT}/anomalies"
+AIRFLOW_API_BASE = os.getenv(
+    "AIRFLOW_API_BASE",
+    "http://airflow-api-server:8080/api/v2",
+).rstrip("/")
+AIRFLOW_ADMIN_USER = os.getenv("AIRFLOW_ADMIN_USER", "admin")
+AIRFLOW_ADMIN_PASSWORD = os.getenv("AIRFLOW_ADMIN_PASSWORD", "admin")
 
 KAFKA_HOST = os.getenv("KAFKA_HOST", "kafka")
 KAFKA_PORT = int(os.getenv("KAFKA_PORT", "29092"))
@@ -220,6 +228,7 @@ LIVE_PAGE_TITLE_MAX_LEN = int(os.getenv("LIVE_PAGE_TITLE_MAX_LEN", "50"))
 
 MODE_HISTORICAL = "Historical reports"
 MODE_LIVE = "Live streaming"
+MODE_OPS = "Monitoring & Ops"
 
 PLOT_LAYOUT = dict(
     template="plotly_dark",
@@ -229,8 +238,8 @@ PLOT_LAYOUT = dict(
 )
 
 ARCHITECTURE_TEXT = (
-    "**Wikimedia SSE** → **Kafka** → **Spark Structured Streaming** → "
-    "**HDFS Data Lake** → **Airflow (5 DAGs)** → **Streamlit Dashboard**"
+    "**Wikimedia SSE** → **Kafka** → **Spark (Streaming + Batch)** → "
+    "**HDFS** `/data/wikimedia/` → **Airflow (9 DAGs)** → **Streamlit**"
 )
 
 # Catalogue des rapports par DAG (chemins HDFS relatifs à reports/)
@@ -248,6 +257,8 @@ REPORT_CATALOG: dict[str, str] = {
     "anonymous_vs_logged": f"{HDFS_REPORTS_ROOT}/users/anonymous_vs_logged.json",
     "bot_ratio": f"{HDFS_REPORTS_ROOT}/bots/bot_ratio.json",
     "active_bots": f"{HDFS_REPORTS_ROOT}/bots/active_bots.json",
+    "anomalies": f"{HDFS_ANOMALIES_ROOT}/anomalies_summary.json",
+    "monitoring": f"{HDFS_REPORTS_ROOT}/monitoring/latest_pipeline_monitoring.json",
 }
 
 # Anciens chemins (DAG monolithique supprimé) — repli si sous-dossiers absents
@@ -514,6 +525,236 @@ def check_pipeline_status() -> dict[str, dict[str, Any]]:
             "hint": hint,
         }
     return result
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_spark_apps() -> list[dict[str, Any]]:
+    """Liste les applications Spark actives (UI REST)."""
+    try:
+        url = f"{SPARK_UI_URL.rstrip('/')}/json/"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        apps = []
+        for app in payload.get("activeapps", []) or []:
+            apps.append(
+                {
+                    "id": app.get("id"),
+                    "name": app.get("name"),
+                    "cores": app.get("cores"),
+                    "memory": app.get("memoryperexecutor"),
+                }
+            )
+        return apps
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return []
+
+
+def _airflow_root_url() -> str:
+    if AIRFLOW_API_BASE.endswith("/api/v2"):
+        return AIRFLOW_API_BASE[: -len("/api/v2")]
+    return "http://airflow-api-server:8080"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_airflow_jwt_token() -> str:
+    """Airflow 3 : JWT via POST /auth/token (identifiants admin du .env)."""
+    token_url = f"{_airflow_root_url()}/auth/token"
+    body = json.dumps(
+        {"username": AIRFLOW_ADMIN_USER, "password": AIRFLOW_ADMIN_PASSWORD}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        token_url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("Réponse /auth/token sans access_token")
+    return token
+
+
+def _airflow_api_get(path: str, token: str) -> dict[str, Any]:
+    url = f"{AIRFLOW_API_BASE}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_airflow_dag_states() -> list[dict[str, Any]]:
+    """États des DAGs Wikimedia via API Airflow 3 (authentification JWT)."""
+    try:
+        token = _get_airflow_jwt_token()
+    except Exception as exc:
+        return [
+            {
+                "dag_id": "—",
+                "state": f"auth échouée: {exc}",
+                "is_paused": "?",
+            }
+        ]
+
+    dag_ids = [
+        "wikimedia_ingestion",
+        "wikimedia_hdfs_healthcheck",
+        "wikimedia_global_activity",
+        "wikimedia_top_pages",
+        "wikimedia_user_activity",
+        "wikimedia_bot_activity",
+        "wikimedia_anomaly_detection",
+        "wikimedia_automated_reporting",
+        "wikimedia_pipeline_monitoring",
+    ]
+    rows: list[dict[str, Any]] = []
+    for dag_id in dag_ids:
+        row = {"dag_id": dag_id, "state": "unknown", "is_paused": "?"}
+        try:
+            meta = _airflow_api_get(f"/dags/{dag_id}", token)
+            row["is_paused"] = meta.get("is_paused")
+            runs_data = _airflow_api_get(
+                f"/dags/{dag_id}/dagRuns?limit=1&order_by=-start_date",
+                token,
+            )
+            runs = runs_data.get("dag_runs", runs_data)
+            if isinstance(runs, list) and runs:
+                row["state"] = runs[0].get("state", "unknown")
+                row["last_run"] = runs[0].get("start_date", "—")
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            row["state"] = f"erreur: {exc}"
+        rows.append(row)
+    return rows
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_kafka_ops_metrics() -> dict[str, Any]:
+    """Lag Kafka et volumes par topic."""
+    try:
+        from kafka import KafkaConsumer, TopicPartition
+    except ImportError:
+        return {"status": "kafka-python manquant", "total_lag": 0, "topics": {}}
+
+    topics = ["wm.recentchange.raw", "wm.bot.events", "wm.page.edits", "wm.errors"]
+    volumes: dict[str, int] = {}
+    total_lag = 0
+    try:
+        consumer = KafkaConsumer(
+            bootstrap_servers=[KAFKA_BOOTSTRAP],
+            group_id="streamlit-ops-monitor",
+            enable_auto_commit=False,
+        )
+        for topic in topics:
+            parts = consumer.partitions_for_topic(topic) or set()
+            lag_topic = 0
+            volume = 0
+            for p in parts:
+                tp = TopicPartition(topic, p)
+                end = consumer.end_offsets([tp]).get(tp, 0)
+                committed = consumer.committed(tp) or 0
+                lag_topic += max(0, end - committed)
+                volume += end
+            volumes[topic] = volume
+            total_lag += lag_topic
+        consumer.close()
+        return {"status": "ok", "total_lag": total_lag, "topics": volumes}
+    except Exception as exc:
+        return {"status": str(exc), "total_lag": -1, "topics": {}}
+
+
+def fetch_invalid_events_rate(kafka_ops: dict[str, Any], total_processed: int) -> float:
+    """Taux d'événements invalides (topic wm.errors vs volume total)."""
+    errors = (kafka_ops.get("topics") or {}).get("wm.errors", 0)
+    denom = max(1, errors + total_processed)
+    return round((errors / denom) * 100, 2)
+
+
+def render_ops_dashboard_content() -> None:
+    """Dashboard Monitoring & Ops — santé pipeline."""
+    st.markdown("### Monitoring & Ops — pipeline complet")
+
+    pipeline = check_pipeline_status()
+    kafka_ops = fetch_kafka_ops_metrics()
+    spark_apps = fetch_spark_apps()
+    dag_states = fetch_airflow_dag_states()
+    reports = load_all_reports()
+    ga = reports.get("global_activity") or {}
+    total_processed = int(ga.get("total_events") or 0)
+    anomalies_report = load_report("anomalies")
+    monitoring_report = load_report("monitoring")
+    invalid_rate = fetch_invalid_events_rate(kafka_ops, total_processed)
+
+    st.markdown("#### Streaming (temps réel)")
+    events = st.session_state.get("live_events", [])
+    eps = st.session_state.get("live_events_per_sec", 0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("events/sec (live)", f"{eps:.1f}")
+    c2.metric("Événements tampon live", f"{len(events):,}")
+    c3.metric("Bots live (session)", f"{sum(1 for e in events if e.get('is_bot')):,}")
+
+    if events:
+        from collections import Counter as _Counter
+
+        page_c = _Counter(
+            (str(e.get("title") or "?"), str(e.get("wiki") or "?")) for e in events
+        )
+        st.markdown("**Top pages live**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"page": f"{t} ({w})", "éditions": c}
+                    for (t, w), c in page_c.most_common(10)
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("#### Kafka")
+    k1, k2 = st.columns(2)
+    k1.metric("Consumer lag (total)", f"{kafka_ops.get('total_lag', 0):,}")
+    k2.metric("Statut broker", kafka_ops.get("status", "—"))
+    if kafka_ops.get("topics"):
+        st.dataframe(
+            pd.DataFrame(
+                [{"topic": t, "volume_estimé": v} for t, v in kafka_ops["topics"].items()]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("#### Spark")
+    if spark_apps:
+        st.dataframe(pd.DataFrame(spark_apps), use_container_width=True, hide_index=True)
+        st.caption("Jobs Spark actifs (Master UI).")
+    else:
+        st.info("Aucune app Spark active visible — lancez spark-submit streaming ou batch.")
+
+    st.markdown("#### Airflow")
+    if dag_states:
+        st.dataframe(pd.DataFrame(dag_states), use_container_width=True, hide_index=True)
+        failures = sum(1 for d in dag_states if d.get("state") == "failed")
+        st.metric("DAG runs en échec (dernier run)", failures)
+
+    st.markdown("#### Data Quality")
+    anomaly_count = 0
+    if anomalies_report and isinstance(anomalies_report, dict):
+        anomaly_count = int(anomalies_report.get("anomaly_count") or 0)
+    d1, d2 = st.columns(2)
+    d1.metric("Anomalies détectées", f"{anomaly_count:,}")
+    d2.metric("Taux événements invalides", f"{invalid_rate}%")
+    if anomalies_report:
+        sample = anomalies_report.get("anomalies") or []
+        if sample:
+            st.json(sample[:5])
+
+    if monitoring_report:
+        st.markdown("#### Rapport monitoring pipeline")
+        st.json(monitoring_report.get("airflow", {}).get("summary", monitoring_report))
 
 
 def _plot_style(fig) -> None:
@@ -1121,6 +1362,11 @@ def render_page_header() -> None:
             "**Mode Live** — événements consommés directement depuis **Kafka** "
             "(temps réel). Fuseau : **Europe/Paris**."
         )
+    elif mode == MODE_OPS:
+        st.markdown(
+            "**Mode Monitoring & Ops** — Kafka lag, Spark jobs, états Airflow, "
+            "anomalies et qualité des données."
+        )
     else:
         st.markdown(
             "**Mode Historical** — rapports **batch** générés par Airflow sur **HDFS**. "
@@ -1142,7 +1388,7 @@ def render_sidebar() -> None:
         )
         st.radio(
             "Affichage",
-            [MODE_HISTORICAL, MODE_LIVE],
+            [MODE_HISTORICAL, MODE_LIVE, MODE_OPS],
             key="dashboard_mode",
         )
         mode = st.session_state.dashboard_mode
@@ -1157,11 +1403,15 @@ def render_sidebar() -> None:
             st.divider()
             st.markdown("**DAGs Airflow**")
             for dag in [
+                "wikimedia_ingestion",
                 "wikimedia_hdfs_healthcheck",
                 "wikimedia_global_activity",
                 "wikimedia_top_pages",
                 "wikimedia_user_activity",
                 "wikimedia_bot_activity",
+                "wikimedia_anomaly_detection",
+                "wikimedia_automated_reporting",
+                "wikimedia_pipeline_monitoring",
             ]:
                 st.text(f"• {dag}")
         else:
@@ -1205,6 +1455,9 @@ def main() -> None:
             auto_refresh_live()
         else:
             render_live_dashboard_content()
+    elif mode == MODE_OPS:
+        render_ops_dashboard_content()
+        st.caption("Rafraîchissez la page (F5) pour mettre à jour les métriques ops.")
     else:
         if hasattr(st, "fragment"):
             auto_refresh_dashboard()

@@ -1,13 +1,13 @@
 """
 Utilitaires HDFS partagés par les DAGs Wikimedia (WebHDFS + parsing JSON).
-
-Évite de dupliquer le code de lecture/écriture dans chaque DAG Airflow.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -16,13 +16,60 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Configuration réseau Docker (service namenode)
-WEBHDFS_BASE = "http://namenode:9870/webhdfs/v1"
-HDFS_PROCESSED_PATH = "/hdfs-data/wikimedia/processed"
-HDFS_REPORTS_ROOT = "/hdfs-data/wikimedia/reports"
+WEBHDFS_BASE = os.getenv("WEBHDFS_BASE", "http://namenode:9870/webhdfs/v1")
+WEBHDFS_RETRIES = int(os.getenv("WEBHDFS_RETRIES", "5"))
+WEBHDFS_RETRY_DELAY_SEC = float(os.getenv("WEBHDFS_RETRY_DELAY_SEC", "2"))
+# Limite de fichiers lus par run (évite timeouts + surcharge DNS quand Spark écrit beaucoup de parts)
+ANALYTICS_MAX_PROCESSED_FILES = int(os.getenv("ANALYTICS_MAX_PROCESSED_FILES", "60"))
 
-# Dossiers de rapports attendus par le projet
-REPORT_SUBDIRS = ("top_pages", "users", "bots", "global")
+
+def _is_transient_url_error(exc: urllib.error.URLError) -> bool:
+    """True seulement pour erreurs réseau/DNS — pas pour HTTP 3xx/4xx/5xx."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, OSError)
+
+
+def _webhdfs_urlopen(url: str, timeout: int = 30, method: str | None = None, data: bytes | None = None):
+    """Appel WebHDFS avec nouvelles tentatives (DNS Docker parfois instable)."""
+    last_error: Exception | None = None
+    for attempt in range(1, WEBHDFS_RETRIES + 1):
+        try:
+            request = urllib.request.Request(url, data=data, method=method) if method else None
+            if request is not None:
+                return urllib.request.urlopen(request, timeout=timeout)
+            return urllib.request.urlopen(url, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as exc:
+            if not _is_transient_url_error(exc):
+                raise
+            last_error = exc
+            if attempt < WEBHDFS_RETRIES:
+                logger.warning(
+                    "WebHDFS tentative %d/%d échouée (%s), nouvel essai dans %.1fs…",
+                    attempt,
+                    WEBHDFS_RETRIES,
+                    exc,
+                    WEBHDFS_RETRY_DELAY_SEC,
+                )
+                time.sleep(WEBHDFS_RETRY_DELAY_SEC)
+    raise last_error  # type: ignore[misc]
+
+# Chemins HDFS du data lake (hdfs://namenode:8020/data/wikimedia/...)
+HDFS_DATA_ROOT = "/data/wikimedia"
+HDFS_PROCESSED_PATH = f"{HDFS_DATA_ROOT}/processed"
+HDFS_REPORTS_ROOT = f"{HDFS_DATA_ROOT}/reports"
+HDFS_ANOMALIES_ROOT = f"{HDFS_DATA_ROOT}/anomalies"
+HDFS_BATCH_ROOT = f"{HDFS_DATA_ROOT}/batch"
+HDFS_CHECKPOINTS_PATH = f"{HDFS_DATA_ROOT}/checkpoints/stream-consumer"
+
+# Ancien chemin du projet — repli si migration non faite
+LEGACY_DATA_ROOT = "/hdfs-data/wikimedia"
+LEGACY_PROCESSED_PATH = f"{LEGACY_DATA_ROOT}/processed"
+
+REPORT_SUBDIRS = ("top_pages", "users", "bots", "global", "monitoring")
 
 
 def utc_now_iso() -> str:
@@ -30,10 +77,15 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def today_report_date() -> str:
+    """Date du rapport journalier (YYYY-MM-DD)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def webhdfs_list_dir(hdfs_dir: str) -> list[dict[str, Any]]:
     """Liste le contenu d'un répertoire HDFS (op=LISTSTATUS)."""
     url = f"{WEBHDFS_BASE}{hdfs_dir}?op=LISTSTATUS"
-    with urllib.request.urlopen(url, timeout=30) as response:
+    with _webhdfs_urlopen(url, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return payload["FileStatuses"]["FileStatus"]
 
@@ -42,7 +94,7 @@ def webhdfs_path_exists(hdfs_path: str) -> bool:
     """Vérifie qu'un chemin HDFS existe (fichier ou dossier)."""
     url = f"{WEBHDFS_BASE}{hdfs_path}?op=GETFILESTATUS"
     try:
-        with urllib.request.urlopen(url, timeout=15) as response:
+        with _webhdfs_urlopen(url, timeout=15) as response:
             return response.status == 200
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -53,16 +105,30 @@ def webhdfs_path_exists(hdfs_path: str) -> bool:
 def webhdfs_open_text(hdfs_path: str) -> str:
     """Lit un fichier HDFS en texte (op=OPEN)."""
     url = f"{WEBHDFS_BASE}{hdfs_path}?op=OPEN"
-    with urllib.request.urlopen(url, timeout=120) as response:
+    with _webhdfs_urlopen(url, timeout=120) as response:
         return response.read().decode("utf-8")
 
 
-def webhdfs_write_json(hdfs_path: str, payload: dict[str, Any]) -> str:
-    """
-    Écrit un dictionnaire en JSON sur HDFS (CREATE + redirection 307).
+def webhdfs_mkdirs(hdfs_dir: str) -> None:
+    """Crée un répertoire HDFS (op=MKDIRS) s'il n'existe pas."""
+    path = hdfs_dir.rstrip("/")
+    if not path or webhdfs_path_exists(path):
+        return
+    url = f"{WEBHDFS_BASE}{path}?op=MKDIRS"
+    try:
+        _webhdfs_urlopen(url, timeout=30, method="PUT")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 409):
+            return
+        raise
 
-    Retourne le chemin HDFS écrit.
-    """
+
+def webhdfs_write_json(hdfs_path: str, payload: dict[str, Any]) -> str:
+    """Écrit un dictionnaire en JSON sur HDFS (CREATE + redirection 307)."""
+    parent = os.path.dirname(hdfs_path.rstrip("/"))
+    if parent:
+        webhdfs_mkdirs(parent)
+
     content = json.dumps(payload, ensure_ascii=False, indent=2)
     create_url = f"{WEBHDFS_BASE}{hdfs_path}?op=CREATE&overwrite=true"
     request = urllib.request.Request(create_url, method="PUT")
@@ -74,21 +140,23 @@ def webhdfs_write_json(hdfs_path: str, payload: dict[str, Any]) -> str:
         redirect_url = error.headers.get("Location")
         if not redirect_url:
             raise RuntimeError(f"WebHDFS CREATE sans Location : {hdfs_path}") from error
-        put_request = urllib.request.Request(
+        _webhdfs_urlopen(
             redirect_url,
-            data=content.encode("utf-8"),
+            timeout=120,
             method="PUT",
+            data=content.encode("utf-8"),
         )
-        urllib.request.urlopen(put_request, timeout=120)
-    logger.info("Rapport écrit sur HDFS : %s", hdfs_path)
+    logger.info("Fichier HDFS écrit : %s", hdfs_path)
     return hdfs_path
 
 
-def discover_processed_json_files() -> list[str]:
-    """Parcourt processed/ et retourne tous les fichiers .json (hors _spark_metadata)."""
+def _discover_json_under(root: str) -> list[str]:
+    """Parcourt un répertoire HDFS et liste les fichiers .json."""
     json_files: list[str] = []
-    directories_to_visit = [HDFS_PROCESSED_PATH.rstrip("/")]
+    if not webhdfs_path_exists(root):
+        return json_files
 
+    directories_to_visit = [root.rstrip("/")]
     while directories_to_visit:
         current = directories_to_visit.pop()
         try:
@@ -108,6 +176,19 @@ def discover_processed_json_files() -> list[str]:
     return sorted(json_files)
 
 
+def discover_processed_json_files() -> list[str]:
+    """Liste les JSON processed (chemin courant, repli legacy)."""
+    files = _discover_json_under(HDFS_PROCESSED_PATH)
+    if files:
+        return files
+    return _discover_json_under(LEGACY_PROCESSED_PATH)
+
+
+def discover_anomaly_json_files() -> list[str]:
+    """Liste les fichiers d'anomalies sur HDFS."""
+    return _discover_json_under(HDFS_ANOMALIES_ROOT)
+
+
 def parse_events_from_hdfs_file(hdfs_file: str) -> list[dict[str, Any]]:
     """Lit un fichier JSON ligne par ligne (format Spark Streaming)."""
     events: list[dict[str, Any]] = []
@@ -125,12 +206,16 @@ def parse_events_from_hdfs_file(hdfs_file: str) -> list[dict[str, Any]]:
 
 
 def load_all_processed_events() -> tuple[list[dict[str, Any]], list[str]]:
-    """
-    Charge tous les événements depuis la zone processed.
-
-    Retourne (liste d'événements, liste des fichiers lus).
-    """
+    """Charge tous les événements depuis la zone processed."""
     json_files = discover_processed_json_files()
+    if len(json_files) > ANALYTICS_MAX_PROCESSED_FILES:
+        skipped = len(json_files) - ANALYTICS_MAX_PROCESSED_FILES
+        json_files = json_files[-ANALYTICS_MAX_PROCESSED_FILES:]
+        logger.warning(
+            "Limite analytics : %d fichier(s) ignoré(s), lecture des %d plus récents.",
+            skipped,
+            ANALYTICS_MAX_PROCESSED_FILES,
+        )
     all_events: list[dict[str, Any]] = []
 
     for hdfs_file in json_files:
@@ -142,10 +227,27 @@ def load_all_processed_events() -> tuple[list[dict[str, Any]], list[str]]:
     return all_events, json_files
 
 
+def load_all_anomalies() -> list[dict[str, Any]]:
+    """Charge toutes les anomalies enregistrées sur HDFS."""
+    anomalies: list[dict[str, Any]] = []
+    for hdfs_file in discover_anomaly_json_files():
+        if hdfs_file.endswith("anomalies_summary.json"):
+            continue
+        try:
+            payload = json.loads(webhdfs_open_text(hdfs_file))
+            if isinstance(payload, dict) and "anomalies" in payload:
+                anomalies.extend(payload["anomalies"])
+            elif isinstance(payload, list):
+                anomalies.extend(payload)
+            elif isinstance(payload, dict):
+                anomalies.append(payload)
+        except (json.JSONDecodeError, urllib.error.URLError) as exc:
+            logger.warning("Anomalie non lue %s : %s", hdfs_file, exc)
+    return anomalies
+
+
 def wiki_to_language(wiki: str | None) -> str:
-    """
-    Déduit une langue à partir du code wiki (ex. enwiki → en, frwiki → fr).
-    """
+    """Déduit une langue à partir du code wiki (ex. enwiki → en)."""
     if not wiki:
         return "unknown"
     wiki = str(wiki).strip()
@@ -189,6 +291,6 @@ def page_key(event: dict[str, Any]) -> tuple[str, str]:
     return (str(event.get("title") or "unknown"), str(event.get("wiki") or "unknown"))
 
 
-# Types Wikimedia recentchange courants pour création / suppression
 CREATE_TYPES = frozenset({"new", "create"})
 DELETE_TYPES = frozenset({"delete", "remove"})
+EDIT_TYPES = frozenset({"edit", "annotate"})
